@@ -1,0 +1,127 @@
+循环神经网络的简介实现
+定义模型
+我们使用Pytorch中的nn.RNN来构造循环神经网络。在本节中，我们主要关注nn.RNN的以下几个构造函数参数：
+
+input_size - The number of expected features in the input x
+hidden_size – The number of features in the hidden state h
+nonlinearity – The non-linearity to use. Can be either 'tanh' or 'relu'. Default: 'tanh'
+batch_first – If True, then the input and output tensors are provided as (batch_size, num_steps, input_size). Default: False
+这里的batch_first决定了输入的形状，我们使用默认的参数False，对应的输入形状是 (num_steps, batch_size, input_size)。
+
+forward函数的参数为：
+
+input of shape (num_steps, batch_size, input_size): tensor containing the features of the input sequence.
+h_0 of shape (num_layers * num_directions, batch_size, hidden_size): tensor containing the initial hidden state for each element in the batch. Defaults to zero if not provided. If the RNN is bidirectional, num_directions should be 2, else it should be 1.
+forward函数的返回值是：
+
+output of shape (num_steps, batch_size, num_directions * hidden_size): tensor containing the output features (h_t) from the last layer of the RNN, for each t.
+h_n of shape (num_layers * num_directions, batch_size, hidden_size): tensor containing the hidden state for t = num_steps.
+现在我们构造一个nn.RNN实例，并用一个简单的例子来看一下输出的形状。
+
+rnn_layer = nn.RNN(input_size=vocab_size, hidden_size=num_hiddens)
+num_steps, batch_size = 35, 2
+X = torch.rand(num_steps, batch_size, vocab_size)
+state = None
+Y, state_new = rnn_layer(X, state)
+print(Y.shape, state_new.shape)
+torch.Size([35, 2, 256]) torch.Size([1, 2, 256])
+我们定义一个完整的基于循环神经网络的语言模型。
+
+class RNNModel(nn.Module):
+    def __init__(self, rnn_layer, vocab_size):
+        super(RNNModel, self).__init__()
+        self.rnn = rnn_layer
+        self.hidden_size = rnn_layer.hidden_size * (2 if rnn_layer.bidirectional else 1) 
+        self.vocab_size = vocab_size
+        self.dense = nn.Linear(self.hidden_size, vocab_size)
+
+    def forward(self, inputs, state):
+        # inputs.shape: (batch_size, num_steps)
+        X = to_onehot(inputs, vocab_size)
+        X = torch.stack(X)  # X.shape: (num_steps, batch_size, vocab_size)
+        hiddens, state = self.rnn(X, state)
+        hiddens = hiddens.view(-1, hiddens.shape[-1])  # hiddens.shape: (num_steps * batch_size, hidden_size)
+        output = self.dense(hiddens)
+        return output, state
+类似的，我们需要实现一个预测函数，与前面的区别在于前向计算和初始化隐藏状态。
+
+def predict_rnn_pytorch(prefix, num_chars, model, vocab_size, device, idx_to_char,
+                      char_to_idx):
+    state = None
+    output = [char_to_idx[prefix[0]]]  # output记录prefix加上预测的num_chars个字符
+    for t in range(num_chars + len(prefix) - 1):
+        X = torch.tensor([output[-1]], device=device).view(1, 1)
+        (Y, state) = model(X, state)  # 前向计算不需要传入模型参数
+        if t < len(prefix) - 1:
+            output.append(char_to_idx[prefix[t + 1]])
+        else:
+            output.append(Y.argmax(dim=1).item())
+    return ''.join([idx_to_char[i] for i in output])
+使用权重为随机值的模型来预测一次。
+
+model = RNNModel(rnn_layer, vocab_size).to(device)
+predict_rnn_pytorch('分开', 10, model, vocab_size, device, idx_to_char, char_to_idx)
+'分开胸呵以轮轮轮轮轮轮轮'
+接下来实现训练函数，这里只使用了相邻采样。
+
+def train_and_predict_rnn_pytorch(model, num_hiddens, vocab_size, device,
+                                corpus_indices, idx_to_char, char_to_idx,
+                                num_epochs, num_steps, lr, clipping_theta,
+                                batch_size, pred_period, pred_len, prefixes):
+    loss = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.to(device)
+    for epoch in range(num_epochs):
+        l_sum, n, start = 0.0, 0, time.time()
+        data_iter = d2l.data_iter_consecutive(corpus_indices, batch_size, num_steps, device) # 相邻采样
+        state = None
+        for X, Y in data_iter:
+            if state is not None:
+                # 使用detach函数从计算图分离隐藏状态
+                if isinstance (state, tuple): # LSTM, state:(h, c)  
+                    state[0].detach_()
+                    state[1].detach_()
+                else: 
+                    state.detach_()
+            (output, state) = model(X, state) # output.shape: (num_steps * batch_size, vocab_size)
+            y = torch.flatten(Y.T)
+            l = loss(output, y.long())
+            
+            optimizer.zero_grad()
+            l.backward()
+            grad_clipping(model.parameters(), clipping_theta, device)
+            optimizer.step()
+            l_sum += l.item() * y.shape[0]
+            n += y.shape[0]
+        
+
+        if (epoch + 1) % pred_period == 0:
+            print('epoch %d, perplexity %f, time %.2f sec' % (
+                epoch + 1, math.exp(l_sum / n), time.time() - start))
+            for prefix in prefixes:
+                print(' -', predict_rnn_pytorch(
+                    prefix, pred_len, model, vocab_size, device, idx_to_char,
+                    char_to_idx))
+训练模型。
+
+num_epochs, batch_size, lr, clipping_theta = 250, 32, 1e-3, 1e-2
+pred_period, pred_len, prefixes = 50, 50, ['分开', '不分开']
+train_and_predict_rnn_pytorch(model, num_hiddens, vocab_size, device,
+                            corpus_indices, idx_to_char, char_to_idx,
+                            num_epochs, num_steps, lr, clipping_theta,
+                            batch_size, pred_period, pred_len, prefixes)
+epoch 50, perplexity 9.405654, time 0.52 sec
+ - 分开始一起 三步四步望著天 看星星 一颗两颗三颗四颗 连成线背著背默默许下心愿  一枝杨柳 你的那我 在
+ - 不分开 爱情你的手 一人的老斑鸠 腿短毛不多 快使用双截棍 哼哼哈兮 快使用双截棍 哼哼哈兮 快使用双截棍
+epoch 100, perplexity 1.255020, time 0.54 sec
+ - 分开 我人了的屋我 一定令它心仪的母斑鸠 爱像一阵风 吹完美主  这样 还人的太快就是学怕眼口让我碰恨这
+ - 不分开不想我多的脑袋有问题 随便说说 其实我早已经猜透看透不想多说 只是我怕眼泪撑不住 不懂 你的黑色幽默
+epoch 150, perplexity 1.064527, time 0.53 sec
+ - 分开 我轻外的溪边 默默在一心抽离 有话不知不觉 一场悲剧 我对不起 藤蔓植物的爬满了伯爵的坟墓 古堡里
+ - 不分开不想不多的脑 有教堂有你笑 我有多烦恼  没有你烦 有有样 别怪走 快后悔没说你 我不多难熬 我想就
+epoch 200, perplexity 1.033074, time 0.53 sec
+ - 分开 我轻外的溪边 默默在一心向昏 的愿  古无着我只能 一个黑远 这想太久 这样我 不要再是你打我妈妈
+ - 不分开你只会我一起睡著 样 娘子却只想你和汉堡 我想要你的微笑每天都能看到  我知道这里很美但家乡的你更美
+epoch 250, perplexity 1.047890, time 0.68 sec
+ - 分开 我轻多的漫 却已在你人演  想要再直你 我想要这样牵着你的手不放开 爱可不可以简简单单没有伤害 你
+ - 不分开不想不多的假  已无能为力再提起 决定中断熟悉 然后在这里 不限日期 然后将过去 慢慢温习 让我爱上
